@@ -66,7 +66,7 @@ static EVP_MD_CTX *opensslecdsa_createctx(popt_live_sig_alg_t alg);
 static void opensslecdsa_destroyctx(EVP_MD_CTX *evp_md_ctx);
 static int opensslecdsa_adddata(EVP_MD_CTX *evp_md_ctx, unsigned char *data, unsigned int datalength);
 #ifdef OPENSSL
-static int BN_bn2bin_fixed(BIGNUM *bn, unsigned char *buf, int size);
+static int BN_bn2bin_fixed(const BIGNUM *bn, unsigned char *buf, int size);
 #endif
 static int opensslecdsa_sign(popt_live_sig_alg_t alg,EVP_PKEY *pkey, EVP_MD_CTX *evp_md_ctx, struct evbuffer *evb);
 static int opensslecdsa_verify(popt_live_sig_alg_t alg,EVP_PKEY *pkey, EVP_MD_CTX *evp_md_ctx, unsigned char *sigdata,
@@ -155,7 +155,7 @@ std::string    Signature::hex() const
     for (int i=0; i<siglen_; i++)
         sprintf(hex+i*2, "%02x", (int)(unsigned char)sigbits_[i]);
     std::string s(hex,siglen_*2);
-    delete hex;
+    delete[] hex;
     return s;
 }
 
@@ -372,9 +372,9 @@ SwarmPubKey::SwarmPubKey(std::string hexstr)
     } else {
         bits_ = NULL;
         len_ = 0;
-        delete bits;
+        delete[] bits;
     }
-    delete hexcstr;
+    delete[] hexcstr;
 }
 
 SwarmPubKey::~SwarmPubKey()
@@ -416,7 +416,7 @@ std::string SwarmPubKey::hex() const
     for (int i=0; i<len_; i++)
         sprintf(hex+i*2, "%02x", (int)(unsigned char)bits_[i]);
     std::string s(hex,len_*2);
-    delete hex;
+    delete[] hex;
     return s;
 }
 
@@ -477,7 +477,7 @@ static EVP_PKEY *fake_openssl_read_private_key(std::string keypairfilename, popt
     if (pkey == NULL)
         return NULL;
 
-    int keytype = EVP_PKEY_type(pkey->type);
+    int keytype = EVP_PKEY_type(EVP_PKEY_id(pkey));
 
     if (keytype == EVP_PKEY_RSA)
         *algptr = POPT_LIVE_SIG_ALG_RSASHA1;
@@ -515,16 +515,31 @@ static EVP_PKEY *fake_openssl_read_private_key(std::string keypairfilename, popt
  */
 
 #if defined(RSA_FLAG_NO_BLINDING)
+#  if OPENSSL_VERSION_NUMBER >= 0x10100005L
+#define SET_FLAGS(rsa) \
+    do { \
+        RSA_clear_flags(rsa, RSA_FLAG_BLINDING); \
+        RSA_set_flags(rsa, RSA_FLAG_NO_BLINDING); \
+    } while (0)
+#  else
 #define SET_FLAGS(rsa) \
     do { \
         (rsa)->flags &= ~RSA_FLAG_BLINDING; \
         (rsa)->flags |= RSA_FLAG_NO_BLINDING; \
     } while (0)
+#  endif
 #else
+#  if OPENSSL_VERSION_NUMBER >= 0x10100005L
+#define SET_FLAGS(rsa) \
+    do { \
+        RSA_clear_flags(rsa, RSA_FLAG_BLINDING); \
+    } while (0)
+#  else
 #define SET_FLAGS(rsa) \
     do { \
         (rsa)->flags &= ~RSA_FLAG_BLINDING; \
     } while (0)
+#  endif
 #endif
 
 
@@ -567,12 +582,12 @@ static int opensslrsa_sign(EVP_PKEY *pkey, EVP_MD_CTX *evp_md_ctx, struct evbuff
         return 0;
 
     if (!EVP_SignFinal(evp_md_ctx, sigdata, &siglen, pkey)) {
-        delete sigdata;
+        delete[] sigdata;
         return 0;
     }
 
     evbuffer_add(evb,sigdata,siglen);
-    delete sigdata;
+    delete[] sigdata;
 
     return 1;
 }
@@ -588,7 +603,11 @@ static int opensslrsa_verify2(EVP_PKEY *pkey, EVP_MD_CTX *evp_md_ctx, int maxbit
     rsa = EVP_PKEY_get1_RSA(pkey);
     if (rsa == NULL)
         return 0;
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    bits = BN_num_bits(RSA_get0_e(rsa));
+#else
     bits = BN_num_bits(rsa->e);
+#endif
     RSA_free(rsa);
     if (bits > maxbits && maxbits != 0)
         return 0;
@@ -602,8 +621,13 @@ static int generate_progress_cb(int p, int n, BN_GENCB *cb)
 {
     simple_openssl_callback_t   func;
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    if (BN_GENCB_get_arg(cb) != NULL) {
+        func = (simple_openssl_callback_t)BN_GENCB_get_arg(cb);
+#else
     if (cb->arg != NULL) {
         func = (simple_openssl_callback_t)cb->arg;
+#endif
         func(p);
     }
     return 1;
@@ -613,7 +637,11 @@ static int generate_progress_cb(int p, int n, BN_GENCB *cb)
 
 static EVP_PKEY *opensslrsa_generate(uint16_t keysize, int exp, simple_openssl_callback_t callback)
 {
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    BN_GENCB *cb = BN_GENCB_new();
+#else
     BN_GENCB cb;
+#endif
     RSA *rsa = RSA_new();
     BIGNUM *e = BN_new();
     EVP_PKEY *pkey = EVP_PKEY_new();
@@ -645,10 +673,18 @@ static EVP_PKEY *opensslrsa_generate(uint16_t keysize, int exp, simple_openssl_c
         BN_set_bit(e, 0);
         BN_set_bit(e, 32);
     }
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    BN_GENCB_set(cb, &generate_progress_cb, (void *)callback);
+
+    if (RSA_generate_key_ex(rsa, keysize, e, cb)) {
+        // Success
+        BN_GENCB_free(cb);
+#else
     BN_GENCB_set(&cb, &generate_progress_cb, (void *)callback);
 
     if (RSA_generate_key_ex(rsa, keysize, e, &cb)) {
         // Success
+#endif
         BN_free(e);
         SET_FLAGS(rsa);
         RSA_free(rsa);
@@ -670,8 +706,13 @@ static int opensslrsa_todns(struct evbuffer *evb,EVP_PKEY *pkey)
     if (rsa == NULL)
         return 0;
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    e_bytes = BN_num_bytes(RSA_get0_e(rsa));
+    mod_bytes = BN_num_bytes(RSA_get0_n(rsa));
+#else
     e_bytes = BN_num_bytes(rsa->e);
     mod_bytes = BN_num_bytes(rsa->n);
+#endif
 
     // RFC3110
     if (e_bytes < 256) {    /*%< key exponent is <= 2040 bits */
@@ -682,15 +723,23 @@ static int opensslrsa_todns(struct evbuffer *evb,EVP_PKEY *pkey)
         evbuffer_add_16be(evb,(uint16_t) e_bytes);
     }
 
-    unsigned char *space = new unsigned char[BN_num_bytes(rsa->e)];
+    unsigned char *space = new unsigned char[e_bytes];
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    BN_bn2bin(RSA_get0_e(rsa), space);
+#else
     BN_bn2bin(rsa->e, space);
-    evbuffer_add(evb,space,BN_num_bytes(rsa->e));
-    delete space;
+#endif
+    evbuffer_add(evb,space,e_bytes);
+    delete[] space;
 
-    space = new unsigned char[BN_num_bytes(rsa->n)];
+    space = new unsigned char[mod_bytes];
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    BN_bn2bin(RSA_get0_n(rsa), space);
+#else
     BN_bn2bin(rsa->n, space);
-    evbuffer_add(evb,space,BN_num_bytes(rsa->n));
-    delete space;
+#endif
+    evbuffer_add(evb,space,mod_bytes);
+    delete[] space;
 
     if (rsa != NULL)
         RSA_free(rsa);
@@ -732,14 +781,21 @@ static EVP_PKEY *opensslrsa_fromdns(struct evbuffer *evb)
 
     uint8_t *bindata = new uint8_t[e_bytes];
     evbuffer_remove(evb,bindata,e_bytes);
-    rsa->e = BN_bin2bn(bindata, e_bytes, NULL);
-    delete bindata;
+    BIGNUM *e = BN_bin2bn(bindata, e_bytes, NULL);
+    delete[] bindata;
 
     unsigned int n_bytes = evbuffer_get_length(evb);
     bindata = new uint8_t[n_bytes];
     evbuffer_remove(evb,bindata,n_bytes);
-    rsa->n = BN_bin2bn(bindata, n_bytes, NULL);
-    delete bindata;
+    BIGNUM *n = BN_bin2bn(bindata, n_bytes, NULL);
+    delete[] bindata;
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    RSA_set0_key(rsa, n, e, NULL);
+#else
+    rsa->e = e;
+    rsa->n = n;
+#endif
 
     pkey = EVP_PKEY_new();
     if (pkey == NULL) {
@@ -805,7 +861,7 @@ static int opensslecdsa_adddata(EVP_MD_CTX *evp_md_ctx, unsigned char *data, uns
     return 1;
 }
 
-static int BN_bn2bin_fixed(BIGNUM *bn, unsigned char *buf, int size)
+static int BN_bn2bin_fixed(const BIGNUM *bn, unsigned char *buf, int size)
 {
     int bytes = size - BN_num_bytes(bn);
 
@@ -847,12 +903,17 @@ static int opensslecdsa_sign(popt_live_sig_alg_t alg,EVP_PKEY *pkey, EVP_MD_CTX 
         return 0;
     }
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    BN_bn2bin_fixed(ECDSA_SIG_get0_r(ecdsasig), sigdata, siglen / 2);
+    BN_bn2bin_fixed(ECDSA_SIG_get0_s(ecdsasig), sigdata+siglen/2, siglen / 2);
+#else
     BN_bn2bin_fixed(ecdsasig->r, sigdata, siglen / 2);
     BN_bn2bin_fixed(ecdsasig->s, sigdata+siglen/2, siglen / 2);
+#endif
     ECDSA_SIG_free(ecdsasig);
 
     evbuffer_add(evb,sigdata,siglen);
-    delete sigdata;
+    delete[] sigdata;
 
     EC_KEY_free(eckey);
 
@@ -892,6 +953,12 @@ static int opensslecdsa_verify(popt_live_sig_alg_t alg,EVP_PKEY *pkey, EVP_MD_CT
         EC_KEY_free(eckey);
         return 0;
     }
+#if OPENSSL_VERSION_NUMBER >= 0x10100005L
+    BIGNUM *r = BN_bin2bn(cp, siglen / 2, NULL);
+    cp += siglen / 2;
+    BIGNUM *s = BN_bin2bn(cp, siglen / 2, NULL);
+    ECDSA_SIG_set0(ecdsasig, r, s);
+#else
     if (ecdsasig->r != NULL)
         BN_free(ecdsasig->r);
     ecdsasig->r = BN_bin2bn(cp, siglen / 2, NULL);
@@ -899,6 +966,7 @@ static int opensslecdsa_verify(popt_live_sig_alg_t alg,EVP_PKEY *pkey, EVP_MD_CT
     if (ecdsasig->s != NULL)
         BN_free(ecdsasig->s);
     ecdsasig->s = BN_bin2bn(cp, siglen / 2, NULL);
+#endif
     /* cp += siglen / 2; */
 
     status = ECDSA_do_verify(digest, dgstlen, ecdsasig, eckey);
@@ -1010,7 +1078,7 @@ static EVP_PKEY *opensslecdsa_fromdns(popt_live_sig_alg_t alg,struct evbuffer *e
 
     buf[0] = POINT_CONVERSION_UNCOMPRESSED;
     memcpy(buf + 1, bindata, len);
-    delete bindata;
+    delete[] bindata;
     cp = buf;
     if (o2i_ECPublicKey(&eckey,
                         (const unsigned char **) &cp,
